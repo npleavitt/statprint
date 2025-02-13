@@ -1,16 +1,43 @@
 from docx import Document
-from docx.shared import Inches
+from docx.shared import Inches, Pt
 from fpdf import FPDF
 import pandas as pd
 
 class StatPrint:
-    def __init__(self, filename="report", doc_type="word", title="Report"):
-        # Initialize with default filename, doc_type, and title
+    def __init__(self, filename="report", doc_type="word", title="Report", table_theme=None):
+        # Initialize with default filename, document type, and title
         self.filename = filename
         self.doc_type = doc_type
-        self.title = title  # Set the title
+        self.title = title
         self.content = []
         self.graph_count = 0  # To create unique filenames for graphs
+        
+        # Set a default table theme if one isn't provided.
+        # Colors are given as hex strings (without '#').
+        # 'table_width' is in twips (1/20 of a point, commonly used in Word's XML) or as a string;
+        # if None, the table will use its default width.
+        if table_theme is None:
+            self.table_theme = {
+                'header_bg_color': 'D9D9D9',
+                'row_bg_color_even': 'F2F2F2',
+                'row_bg_color_odd': None,  # Leave odd rows with no fill
+                'table_width': None  # e.g., '5000' (dxa) to set a fixed width, or None to auto-fit
+            }
+        else:
+            self.table_theme = table_theme
+
+    def add_cover_page(self, title, subtitle=None, author=None, date=None):
+        """
+        Add a cover page to the report. This will be inserted at the beginning.
+        """
+        cover_content = {
+            'title': title,
+            'subtitle': subtitle,
+            'author': author,
+            'date': date
+        }
+        # Insert at the beginning of content
+        self.content.insert(0, ('cover', cover_content))
 
     def add_heading(self, heading):
         """Add a heading to the report."""
@@ -30,7 +57,7 @@ class StatPrint:
             indent_rows = []
 
         if isinstance(data, pd.Series):
-            # For Series (often from value_counts), reset the index so you have two columns.
+            # For Series (often from value_counts), reset the index so that you have two columns.
             df = data.reset_index()
             if custom_headers is None:
                 if data.name is not None:
@@ -43,7 +70,7 @@ class StatPrint:
             if custom_headers is not None:
                 df.columns = custom_headers
 
-        # Store the table as a dictionary so that additional styling options can be used later.
+        # Store the table with additional styling options.
         self.content.append(('table', {'df': df, 'custom_headers': custom_headers, 'indent_rows': indent_rows}))
 
     def add_graph(self, graph, filename=None):
@@ -68,30 +95,78 @@ class StatPrint:
         elif self.doc_type == 'pdf':
             self.generate_pdf_report()
 
+    def _set_cell_background(self, cell, color):
+        """
+        Helper method to set the background shading for a cell.
+        :param cell: A docx TableCell object.
+        :param color: A hex color string (without the '#' symbol).
+        """
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        tcPr = cell._tc.find(qn('w:tcPr'))
+        if tcPr is None:
+            tcPr = OxmlElement('w:tcPr')
+            cell._tc.insert(0, tcPr)
+        shd = OxmlElement('w:shd')
+        shd.set(qn('w:fill'), color)
+        tcPr.append(shd)
+
     def _apply_word_table_style(self, table, indent_rows):
         """
         Helper method to modify a docx table:
-          - Makes header text bold.
-          - Removes vertical borders (leaving horizontal borders).
-          - Applies left indentation to rows specified in indent_rows (data rows only).
+          - Applies header styling (bold text and background color).
+          - Sets alternating row shading for data rows.
+          - Applies left indentation for specified rows.
+          - Optionally sets a fixed table width.
         """
-        # Bold header row (assumed to be the first row)
+        from docx.oxml import OxmlElement, parse_xml
+        from docx.oxml.ns import nsdecls, qn
+
+        # Process header row: bold text and header background.
         hdr_cells = table.rows[0].cells
         for cell in hdr_cells:
             for paragraph in cell.paragraphs:
                 for run in paragraph.runs:
                     run.bold = True
+            # Set header background color.
+            if self.table_theme.get('header_bg_color'):
+                self._set_cell_background(cell, self.table_theme['header_bg_color'])
 
-        # Remove vertical borders but keep horizontal borders.
-        from docx.oxml import OxmlElement, parse_xml
-        from docx.oxml.ns import nsdecls, qn
+        # Process data rows: alternating shading and indent if required.
+        for i, row in enumerate(table.rows[1:]):  # skip header row
+            # Determine fill color based on row index.
+            if i % 2 == 0 and self.table_theme.get('row_bg_color_even'):
+                fill_color = self.table_theme['row_bg_color_even']
+            elif i % 2 == 1 and self.table_theme.get('row_bg_color_odd'):
+                fill_color = self.table_theme['row_bg_color_odd']
+            else:
+                fill_color = None
 
-        tbl = table._element
-        tblPr = tbl.find(qn('w:tblPr'))
-        if tblPr is None:
-            tblPr = OxmlElement('w:tblPr')
-            tbl.insert(0, tblPr)
+            for cell in row.cells:
+                if fill_color:
+                    self._set_cell_background(cell, fill_color)
 
+            # Apply left indentation if this row is marked for indenting.
+            if i in indent_rows:
+                first_cell = row.cells[0]
+                for paragraph in first_cell.paragraphs:
+                    paragraph.paragraph_format.left_indent = Inches(0.25)
+
+        # Optionally, set a fixed table width.
+        if self.table_theme.get('table_width'):
+            tbl = table._element
+            tblPr = tbl.find(qn('w:tblPr'))
+            if tblPr is None:
+                tblPr = OxmlElement('w:tblPr')
+                tbl.insert(0, tblPr)
+            tblW = tblPr.find(qn('w:tblW'))
+            if tblW is None:
+                tblW = OxmlElement('w:tblW')
+                tblPr.append(tblW)
+            tblW.set(qn('w:w'), str(self.table_theme['table_width']))
+            tblW.set(qn('w:type'), 'dxa')
+
+        # Adjust borders to remove vertical lines (keeping horizontal lines).
         tblBorders = parse_xml(
             r'<w:tblBorders %s>'
             r'<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
@@ -104,16 +179,26 @@ class StatPrint:
         )
         tblPr.append(tblBorders)
 
-        # Indent specified data rows.
-        # Note: table.rows[0] is the header, so data rows start at index 1.
-        for i, row in enumerate(table.rows[1:]):
-            if i in indent_rows:
-                cell = row.cells[0]
-                for paragraph in cell.paragraphs:
-                    paragraph.paragraph_format.left_indent = Inches(0.25)
-
     def generate_word_report(self):
         doc = Document()
+
+        # If a cover page was added, process it first.
+        # Check if the first content element is a cover.
+        if self.content and self.content[0][0] == 'cover':
+            cover = self.content.pop(0)[1]
+            # Create a cover page with the provided details.
+            doc.add_paragraph()  # add some spacing at the top
+            title_par = doc.add_heading(cover.get('title', self.title), level=0)
+            if cover.get('subtitle'):
+                sub_par = doc.add_paragraph(cover.get('subtitle'))
+            if cover.get('author'):
+                doc.add_paragraph("Author: " + cover.get('author'))
+            if cover.get('date'):
+                doc.add_paragraph("Date: " + cover.get('date'))
+            # Add a page break after the cover page.
+            doc.add_page_break()
+
+        # Add the report title.
         doc.add_heading(self.title, 0)
 
         for content_type, content in self.content:
@@ -123,15 +208,15 @@ class StatPrint:
                 table_info = content
                 df = table_info['df']
                 indent_rows = table_info.get('indent_rows', [])
-                # Create a table with one header row and as many columns as df has
+                # Create a table with one header row and as many columns as the DataFrame has.
                 table = doc.add_table(rows=1, cols=len(df.columns))
                 table.style = 'Table Grid'
 
-                # Add headers
+                # Add header cells.
                 hdr_cells = table.rows[0].cells
                 for i, col_name in enumerate(df.columns):
                     hdr_cells[i].text = str(col_name)
-                    # Make header text bold (in case style doesn't do it)
+                    # Bold header text and apply header background via _apply_word_table_style.
                     for paragraph in hdr_cells[i].paragraphs:
                         for run in paragraph.runs:
                             run.bold = True
@@ -141,11 +226,12 @@ class StatPrint:
                     row_cells = table.add_row().cells
                     for j, value in enumerate(row):
                         row_cells[j].text = str(value)
-                        # If this row is designated to be indented, indent the first cell.
+                        # Apply indentation if needed.
                         if j == 0 and idx in indent_rows:
                             for paragraph in row_cells[j].paragraphs:
                                 paragraph.paragraph_format.left_indent = Inches(0.25)
-                # Apply the border style modifications.
+
+                # Apply publication-ready styling (header styling, alternating row shading, etc.).
                 self._apply_word_table_style(table, indent_rows)
             elif content_type == 'graph':
                 doc.add_paragraph()  # add spacing before image
@@ -180,7 +266,7 @@ class StatPrint:
                 effective_width = pdf.w - 2 * pdf.l_margin
                 col_width = effective_width / len(df.columns)
                 
-                # Header row (bold, no cell borders; draw a horizontal line below)
+                # Header row (bold, no cell borders; draw a horizontal line below).
                 pdf.set_font("Arial", 'B', 10)
                 for col in df.columns:
                     pdf.cell(col_width, 10, str(col), border=0, align='C')
@@ -193,9 +279,8 @@ class StatPrint:
                 for i, row in enumerate(df.itertuples(index=False, name=None)):
                     for j, value in enumerate(row):
                         text = str(value)
-                        # Indent the first column if this row is marked as a subclass.
                         if j == 0 and i in indent_rows:
-                            text = "    " + text  # adjust the number of spaces as needed
+                            text = "    " + text  # Indent if needed.
                         pdf.cell(col_width, 10, text, border=0)
                     pdf.ln(10)
                     # Draw horizontal line after each row.
